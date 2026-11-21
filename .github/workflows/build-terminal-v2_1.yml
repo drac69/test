@@ -24,7 +24,7 @@
 # Requirements (README + .vsconfig): VS 2026 18.6+, Win11 SDK 10.0.26100.8249+, Desktop C++ +
 # WinUI workloads. windows-latest covers these.
 
-name: Build Windows Terminal v2_1
+name: Build Windows Terminal
 
 on:
   workflow_dispatch:
@@ -136,6 +136,11 @@ jobs:
           }
           "BUILT_VERSION=$ver"      >> $env:GITHUB_ENV
           "BUILT_VERSION_DESC=$desc" >> $env:GITHUB_ENV
+          # Upstream's ci.yml sets these two as stubs (0.0.1.0 / 0.0.0.1-ci) for the packaging
+          # steps; MSBuild picks env vars up as properties. Giving them real values is the
+          # least invasive way to try to get a real ProductVersion into the exe.
+          "XES_APPXMANIFESTVERSION=$ver"   >> $env:GITHUB_ENV
+          "XES_PACKAGEVERSIONNUMBER=$ver"  >> $env:GITHUB_ENV
           Write-Host "Version: $desc"
 
       - name: Stamp version into the package manifest(s)
@@ -152,19 +157,6 @@ jobs:
               Write-Host "Stamped $($_.Name) -> $env:BUILT_VERSION"
             }
           }
-
-      # TEMPORARY diagnostic: find where the exe's ProductVersion string is defined.
-      # About reads \StringFileInfo\...\ProductVersion from the exe's version resource when unpackaged.
-      # Delete this step once the patch for it exists.
-      - name: "[diag] Where is ProductVersion defined?"
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          Get-ChildItem -Recurse -Include *.rc,*.rc2,*.h,*.props,*.targets,*.vcxproj -Path src,. -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\(packages|bin|obj|\.git)\\' } |
-            Select-String -Pattern 'ProductVersion|VER_PRODUCTVERSION|VER_FILEVERSION|VersionInfo|XES_' |
-            Select-Object -First 60 |
-            ForEach-Object { "{0}:{1}: {2}" -f $_.Path.Replace($PWD.Path,'.'), $_.LineNumber, $_.Line.Trim() }
 
       # NuGet.Config points at the anonymously readable public Azure DevOps feed
       # (pkgs.dev.azure.com/shine-oss/terminal/_packaging/TerminalDependencies), so plain restore works.
@@ -187,6 +179,17 @@ jobs:
             /p:WindowsTerminalOfficialBuild=true `
             /p:WindowsTerminalBranding=Canary `
             /p:PGOBuildMode=None
+
+      # TEMPORARY diagnostic: what version resource did the exe actually get?
+      # About reads ProductVersion from it. Delete once About shows the right version.
+      - name: "[diag] Version resource of built WindowsTerminal.exe"
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Get-ChildItem bin -Recurse -Filter WindowsTerminal.exe | ForEach-Object {
+            $_.FullName
+            $_.VersionInfo | Format-List FileDescription, FileVersion, ProductVersion, ProductName, InternalName, OriginalFilename | Out-String | Write-Host
+          }
 
       - name: Locate MSIX and WinUI dependency appx
         shell: pwsh
