@@ -24,7 +24,7 @@
 # Requirements (README + .vsconfig): VS 2026 18.6+, Win11 SDK 10.0.26100.8249+, Desktop C++ +
 # WinUI workloads. windows-latest covers these.
 
-name: Build Windows Terminal v2_3
+name: Build Windows Terminal
 
 on:
   workflow_dispatch:
@@ -153,52 +153,72 @@ jobs:
             }
           }
 
-      - name: Add a VERSIONINFO resource to WindowsTerminal.exe
+      - name: "[diag] ApplicationVersion() source (what does About actually read?)"
+        continue-on-error: true
         shell: pwsh
         run: |
-          # Local builds produce an exe with NO version resource, so About (which reads
-          # \StringFileInfo\<lang><cp>\ProductVersion when unpackaged) shows "unknown".
-          # Add our own .rc to the WindowsTerminal project instead of editing its existing one.
-          # Numeric constants are used so we don't depend on winver.h include paths.
-          $p = $env:BUILT_VERSION.Split('.')
-          $rc = @"
-          1 VERSIONINFO
-           FILEVERSION $($p[0]),$($p[1]),$($p[2]),$($p[3])
-           PRODUCTVERSION $($p[0]),$($p[1]),$($p[2]),$($p[3])
-           FILEFLAGSMASK 0x3fL
-           FILEFLAGS 0x0L
-           FILEOS 0x40004L
-           FILETYPE 0x1L
-           FILESUBTYPE 0x0L
-          BEGIN
-              BLOCK "StringFileInfo"
-              BEGIN
-                  BLOCK "040904b0"
-                  BEGIN
-                      VALUE "FileDescription", "Windows Terminal Host"
-                      VALUE "FileVersion", "$env:BUILT_VERSION"
-                      VALUE "InternalName", "WindowsTerminal"
-                      VALUE "OriginalFilename", "WindowsTerminal.exe"
-                      VALUE "ProductName", "Windows Terminal"
-                      VALUE "ProductVersion", "$env:BUILT_VERSION_DESC"
-                  END
-              END
-              BLOCK "VarFileInfo"
-              BEGIN
-                  VALUE "Translation", 0x409, 1200
-              END
-          END
-          "@
-          $dir  = 'src/cascadia/WindowsTerminal'
-          [IO.File]::WriteAllText((Join-Path $PWD "$dir/version.rc"), ($rc -replace "`r", ""), [Text.Encoding]::ASCII)
+          $f = 'src/cascadia/TerminalSettingsModel/CascadiaSettings.cpp'
+          $i = (Select-String -Path $f -Pattern 'CascadiaSettings::ApplicationVersion').LineNumber | Select-Object -First 1
+          Get-Content $f | Select-Object -Skip ($i - 1) -First 60
 
-          $proj = Join-Path $PWD "$dir/WindowsTerminal.vcxproj"
-          $x = [IO.File]::ReadAllText($proj)
-          $n = [regex]::Replace($x, '</Project>\s*$',
-                 "  <ItemGroup>`n    <ResourceCompile Include=`"version.rc`" />`n  </ItemGroup>`n</Project>")
-          if ($n -eq $x) { throw 'Could not add version.rc to WindowsTerminal.vcxproj' }
-          [IO.File]::WriteAllText($proj, $n)
-          Write-Host "Added version.rc ($env:BUILT_VERSION_DESC) to WindowsTerminal.vcxproj"
+      - name: Add VERSIONINFO resources (exe + settings-model dll)
+        shell: pwsh
+        run: |
+          # Local builds produce binaries with NO version resource. When unpackaged, About reads
+          # \VarFileInfo\Translation and then \StringFileInfo\<lang><cp>\ProductVersion from a
+          # binary's version resource, else shows "unknown". The function lives in
+          # Microsoft.Terminal.Settings.Model.dll, so give BOTH it and the exe a resource
+          # (harmless for whichever one it really queries).
+          # We add our own version.rc per project instead of editing existing .rc files.
+          # Numeric constants avoid any dependence on winver.h include paths.
+          $p = $env:BUILT_VERSION.Split('.')
+          $targets = @(
+            @{ Dir='src/cascadia/WindowsTerminal'; Proj='WindowsTerminal.vcxproj'
+               Desc='Windows Terminal Host'; Internal='WindowsTerminal'; File='WindowsTerminal.exe'; Type='0x1L'; Required=$true },
+            @{ Dir='src/cascadia/TerminalSettingsModel/dll'; Proj='Microsoft.Terminal.Settings.Model.vcxproj'
+               Desc='Windows Terminal Settings Model Library'; Internal='Microsoft.Terminal.Settings.Model'; File='Microsoft.Terminal.Settings.Model.dll'; Type='0x2L'; Required=$true }
+          )
+          foreach ($t in $targets) {
+            $rc = @(
+              '1 VERSIONINFO',
+              " FILEVERSION $($p[0]),$($p[1]),$($p[2]),$($p[3])",
+              " PRODUCTVERSION $($p[0]),$($p[1]),$($p[2]),$($p[3])",
+              ' FILEFLAGSMASK 0x3fL',
+              ' FILEFLAGS 0x0L',
+              ' FILEOS 0x40004L',
+              " FILETYPE $($t.Type)",
+              ' FILESUBTYPE 0x0L',
+              'BEGIN',
+              '  BLOCK "StringFileInfo"',
+              '  BEGIN',
+              '    BLOCK "040904b0"',
+              '    BEGIN',
+              "      VALUE `"FileDescription`", `"$($t.Desc)`"",
+              "      VALUE `"FileVersion`", `"$env:BUILT_VERSION`"",
+              "      VALUE `"InternalName`", `"$($t.Internal)`"",
+              "      VALUE `"OriginalFilename`", `"$($t.File)`"",
+              '      VALUE "ProductName", "Windows Terminal"',
+              "      VALUE `"ProductVersion`", `"$env:BUILT_VERSION_DESC`"",
+              '    END',
+              '  END',
+              '  BLOCK "VarFileInfo"',
+              '  BEGIN',
+              '    VALUE "Translation", 0x409, 1200',
+              '  END',
+              'END'
+            ) -join "`n"
+
+            $proj = Join-Path $PWD "$($t.Dir)/$($t.Proj)"
+            if (-not (Test-Path $proj)) { throw "Project not found: $proj" }
+            [IO.File]::WriteAllText((Join-Path $PWD "$($t.Dir)/version.rc"), $rc + "`n", [Text.Encoding]::ASCII)
+
+            $x = [IO.File]::ReadAllText($proj)
+            $n = [regex]::Replace($x, '</Project>\s*$',
+                   "  <ItemGroup>`n    <ResourceCompile Include=`"version.rc`" />`n  </ItemGroup>`n</Project>")
+            if ($n -eq $x) { throw "Could not add version.rc to $($t.Proj)" }
+            [IO.File]::WriteAllText($proj, $n)
+            Write-Host "Added version.rc ($env:BUILT_VERSION_DESC) to $($t.Proj)"
+          }
 
       # NuGet.Config points at the anonymously readable public Azure DevOps feed
       # (pkgs.dev.azure.com/shine-oss/terminal/_packaging/TerminalDependencies), so plain restore works.
@@ -224,13 +244,13 @@ jobs:
 
       # TEMPORARY diagnostic: what version resource did the exe actually get?
       # About reads ProductVersion from it. Delete once About shows the right version.
-      - name: "[diag] Version resource of built WindowsTerminal.exe"
+      - name: "[diag] Version resource of built binaries"
         continue-on-error: true
         shell: pwsh
         run: |
-          Get-ChildItem bin -Recurse -Filter WindowsTerminal.exe | ForEach-Object {
+          Get-ChildItem bin -Recurse -Include WindowsTerminal.exe,Microsoft.Terminal.Settings.Model.dll | ForEach-Object {
             $_.FullName
-            $_.VersionInfo | Format-List FileDescription, FileVersion, ProductVersion, ProductName, InternalName, OriginalFilename | Out-String | Write-Host
+            $_.VersionInfo | Format-List FileDescription, FileVersion, ProductVersion, OriginalFilename | Out-String | Write-Host
           }
 
       - name: Locate MSIX and WinUI dependency appx
