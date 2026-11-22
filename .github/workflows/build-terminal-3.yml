@@ -311,6 +311,19 @@ jobs:
           "DIST_ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
           Write-Host "Distribution zip: $($zip.FullName) ($('{0:N0}' -f $zip.Length) bytes)"
 
+      # TEMPORARY diagnostic: where do the compile-time handoff CLSIDs come from, and do they
+      # match what the MSIX manifest says? (The exe registers the compile-time one.)
+      - name: "[diag] Compile-time handoff CLSIDs"
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          git grep -nE "CLSID_C(Terminal|Console)Handoff" | Select-Object -First 60 | Write-Host
+          Write-Host '--- manifest ExeServer/Class entries ---'
+          Get-ChildItem src/cascadia/CascadiaPackage -Filter 'Package*.appxmanifest' | ForEach-Object {
+            Write-Host "== $($_.Name)"
+            Select-String -Path $_.FullName -Pattern 'ExeServer|com:Class |ProxyStub' | ForEach-Object { $_.Line.Trim() } | Write-Host
+          }
+
       - name: Add handoff register/unregister scripts to the zip
         shell: pwsh
         run: |
@@ -349,29 +362,31 @@ jobs:
           Write-Host "Interfaces       : $($ifaces -join ' ')"
           if ($ifaces.Count -eq 0) { throw 'No proxied interfaces found in AppxManifest.xml' }
 
-          $C = 'HKCU\Software\Classes\CLSID\'
-          $I = 'HKCU\Software\Classes\Interface\'
+          $clsRoot = 'HKCU\Software\Classes\CLSID\'
+          $ifRoot = 'HKCU\Software\Classes\Interface\'
           # Inside a .bat, %%%% becomes %% (the literal key name is "%%Startup").
-          $S = 'HKCU\Console\%%%%Startup'
+          $startKey = 'HKCU\Console\%%%%Startup'
 
           $reg = New-Object Collections.Generic.List[string]
           $reg.Add('@echo off')
           $reg.Add('rem Registers THIS folder as the default terminal (per-user, no admin).')
-          $reg.Add('reg add "' + $C + $term + '\LocalServer32" /ve /d "\"%~dp0WindowsTerminal.exe\"" /f >nul')
-          $reg.Add('reg add "' + $C + $cons + '\LocalServer32" /ve /d "\"%~dp0OpenConsole.exe\"" /f >nul')
-          $reg.Add('reg add "' + $C + $proxy + '\InProcServer32" /ve /d "%~dp0OpenConsoleProxy.dll" /f >nul')
-          $reg.Add('reg add "' + $C + $proxy + '\InProcServer32" /v ThreadingModel /d Both /f >nul')
-          foreach ($i in $ifaces) { $reg.Add('reg add "' + $I + $i + '\ProxyStubClsid32" /ve /d "' + $proxy + '" /f >nul') }
-          $reg.Add('reg add "' + $S + '" /v DelegationConsole /t REG_SZ /d "' + $cons + '" /f >nul')
-          $reg.Add('reg add "' + $S + '" /v DelegationTerminal /t REG_SZ /d "' + $term + '" /f >nul')
+          $reg.Add('reg add "' + $clsRoot + $term + '\LocalServer32" /ve /d "\"%~dp0WindowsTerminal.exe\"" /f >nul')
+          $reg.Add('reg add "' + $clsRoot + $cons + '\LocalServer32" /ve /d "\"%~dp0OpenConsole.exe\"" /f >nul')
+          $reg.Add('reg add "' + $clsRoot + $proxy + '\InProcServer32" /ve /d "%~dp0OpenConsoleProxy.dll" /f >nul')
+          $reg.Add('reg add "' + $clsRoot + $proxy + '\InProcServer32" /v ThreadingModel /d Both /f >nul')
+          foreach ($iid in $ifaces) { $reg.Add('reg add "' + $ifRoot + $iid + '\ProxyStubClsid32" /ve /d "' + $proxy + '" /f >nul') }
+          $reg.Add('reg add "' + $startKey + '" /v DelegationConsole /t REG_SZ /d "' + $cons + '" /f >nul')
+          $reg.Add('reg add "' + $startKey + '" /v DelegationTerminal /t REG_SZ /d "' + $term + '" /f >nul')
+          $reg.Add('reg add "HKCU\Console" /v WindowPosition /t REG_DWORD /d 0x7FFF7FFF /f >nul')
           $reg.Add('echo Registered.')
 
           $unreg = New-Object Collections.Generic.List[string]
           $unreg.Add('@echo off')
-          $unreg.Add('reg delete "' + $S + '" /v DelegationConsole /f >nul 2>&1')
-          $unreg.Add('reg delete "' + $S + '" /v DelegationTerminal /f >nul 2>&1')
-          foreach ($i in $ifaces) { $unreg.Add('reg delete "' + $I + $i + '" /f >nul 2>&1') }
-          foreach ($g in @($term, $cons, $proxy)) { $unreg.Add('reg delete "' + $C + $g + '" /f >nul 2>&1') }
+          $unreg.Add('reg delete "' + $startKey + '" /v DelegationConsole /f >nul 2>&1')
+          $unreg.Add('reg delete "' + $startKey + '" /v DelegationTerminal /f >nul 2>&1')
+          foreach ($iid in $ifaces) { $unreg.Add('reg delete "' + $ifRoot + $iid + '" /f >nul 2>&1') }
+          foreach ($g in @($term, $cons, $proxy)) { $unreg.Add('reg delete "' + $clsRoot + $g + '" /f >nul 2>&1') }
+          $unreg.Add('reg delete "HKCU\Console" /v WindowPosition /f >nul 2>&1')
           $unreg.Add('echo Unregistered.')
 
           $z = [System.IO.Compression.ZipFile]::Open($env:DIST_ZIP, 'Update')
