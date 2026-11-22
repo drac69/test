@@ -1,0 +1,394 @@
+# Build Windows Terminal (microsoft/terminal) on GitHub Actions, with a local patch on top.
+#
+# Repo layout (this repo, NOT a fork of microsoft/terminal):
+#   .github/workflows/build-terminal.yml   <- this file
+#   terminal-customizations.patch          <- applied on top of the pinned upstream commit
+#
+# Produces: WindowsTerminal-x64-portable.zip (+ matching symbols zip), published as a release.
+#
+# THE RECIPE (mirrors microsoft's build/pipelines/templates-v2/job-build-project.yml):
+#   1. Build the solution TARGET Terminal\CascadiaPackage (not the whole solution: that pulls in
+#      the test host apps, whose _ValidateAppxPackage needs TAEF -> APPX0703). Building through
+#      the solution keeps code-gen ordering intact. Signing auto-disables because
+#      CascadiaPackage_TemporaryKey.pfx isn't in the repo.
+#   2. Locate the produced .msix and the arch-matched Microsoft.UI.Xaml dependency .appx.
+#   3. Run build/scripts/New-UnpackagedTerminalDistribution.ps1: unpacks both packages, strips
+#      *.xml/*.winmd/Appx*, copies the WinUI runtime, MERGES the two resources.pri files with
+#      makepri (without the MUX half XAML fail-fasts with 0x802B000A at startup), and drops the
+#      .portable marker so settings live next to the exe.
+#   4. Zip the result.
+#
+# Per-project PRIs in bin\ look like tiny stubs. That is normal: the real resources.pri lives
+# under the AppPackages layout, not in bin\.
+#
+# Requirements (README + .vsconfig): VS 2026 18.6+, Win11 SDK 10.0.26100.8249+, Desktop C++ +
+# WinUI workloads. windows-latest covers these.
+
+name: Build Windows Terminal
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream branch / tag / commit SHA to build. Empty = the pinned TERMINAL_REF below.'
+        required: false
+        default: ''
+
+env:
+  # Pinned upstream commit (1.25 release-branch). Bump deliberately, then check the patch still applies.
+  TERMINAL_REF: f88b209f1e57e1d8ca35977260c3cddacccaeb31
+
+# needed to create a release via the GitHub API
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    defaults:
+      run:
+        # Every `run:` step executes inside the upstream checkout unless it says otherwise.
+        working-directory: terminal
+
+    steps:
+      - name: Checkout this repo (workflow + patch)
+        uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Checkout microsoft/terminal at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/terminal
+          ref: ${{ inputs.ref != '' && inputs.ref || env.TERMINAL_REF }}
+          fetch-depth: 0  # versioning targets inspect git history/tags
+          submodules: recursive
+          path: terminal
+
+      - name: Record the commit actually built
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          "BUILT_SHA=$sha"                  >> $env:GITHUB_ENV
+          "BUILT_SHA_SHORT=$($sha.Substring(0,10))" >> $env:GITHUB_ENV
+          Write-Host "Building microsoft/terminal @ $sha"
+
+      - name: Apply local customizations patch
+        shell: pwsh
+        run: |
+          # terminal-customizations.patch (in this repo's root) does two things:
+          #   (1) TermControl.xaml: scrollbar widened to 24px, thumb pinned at full width,
+          #       no hover-expand animation.
+          #   (2) TerminalWindow.cpp/.h: drop the "Settings" entry from the Win32 system menu
+          #       (it landed after "Close"). Settings stays reachable via Ctrl+, / palette / dropdown.
+          #
+          # Line endings: git apply matches context byte-for-byte and does NOT treat \r as
+          # whitespace, and checkouts can come up with mixed CRLF/LF per file type. So force the
+          # patch and its three target files to LF right before applying. MSVC and the XAML
+          # compiler build LF sources fine.
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'mine/terminal-customizations.patch'
+          if (-not (Test-Path $patch)) {
+            throw "terminal-customizations.patch not found in the repo root ($patch)"
+          }
+
+          $patchText = [IO.File]::ReadAllText($patch) -replace "`r", ""
+          [IO.File]::WriteAllText($patch, $patchText)
+
+          $targets = @(
+            'src/cascadia/TerminalControl/TermControl.xaml',
+            'src/cascadia/TerminalApp/TerminalWindow.cpp',
+            'src/cascadia/TerminalApp/TerminalWindow.h'
+          )
+          foreach ($t in $targets) {
+            $full = Join-Path $PWD $t
+            if (Test-Path $full) {
+              $c = [IO.File]::ReadAllText($full) -replace "`r", ""
+              [IO.File]::WriteAllText($full, $c)
+            }
+          }
+
+          # No fuzz: if upstream context drifted, fail early with an actionable message.
+          & git apply --check --verbose $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "Patch does not apply to $env:BUILT_SHA. Bump/rebase TERMINAL_REF or regenerate the patch."
+          }
+          & git apply --verbose $patch
+          if ($LASTEXITCODE -ne 0) { throw "git apply failed (exit $LASTEXITCODE)" }
+          Write-Host 'terminal-customizations.patch applied.'
+
+      - name: Derive version from the nearest release tag
+        shell: pwsh
+        run: |
+          # Terminal's release tags look like v1.25.1234.0. Local builds don't get a real version
+          # (the official pipeline stamps it), so take it from the nearest tag reachable from HEAD.
+          $tag = (git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*.[0-9]*' 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not $tag) {
+            Write-Host '::warning::No release tag reachable from this commit; falling back to 0.0.1.0'
+            $ver = '0.0.1.0'; $desc = '0.0.1.0'
+          } else {
+            $tag  = $tag.Trim()
+            $ver  = $tag.TrimStart('v')
+            $dist = [int](git rev-list --count "$tag..HEAD")
+            # $desc is for humans (release title); $ver must stay a pure 4-part number for the manifest.
+            $desc = if ($dist -gt 0) { "$ver+$dist" } else { $ver }
+          }
+          "BUILT_VERSION=$ver"      >> $env:GITHUB_ENV
+          "BUILT_VERSION_DESC=$desc" >> $env:GITHUB_ENV
+          Write-Host "Version: $desc"
+
+      - name: Stamp version into the package manifest(s)
+        shell: pwsh
+        run: |
+          # Set <Identity Version="..."> so the MSIX, the produced zip name and the package
+          # identity carry the real version instead of the 0.0.1.0 placeholder.
+          Get-ChildItem src/cascadia/CascadiaPackage -Filter 'Package*.appxmanifest' | ForEach-Object {
+            $x = [IO.File]::ReadAllText($_.FullName)
+            $n = [regex]::Replace($x, '(<Identity\b[^>]*?\bVersion=")[^"]*(")',
+                                  ('${1}' + $env:BUILT_VERSION + '${2}'), 1)
+            if ($n -ne $x) {
+              [IO.File]::WriteAllText($_.FullName, $n)
+              Write-Host "Stamped $($_.Name) -> $env:BUILT_VERSION"
+            }
+          }
+
+      - name: "[diag] ApplicationVersion() source (what does About actually read?)"
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $f = 'src/cascadia/TerminalSettingsModel/CascadiaSettings.cpp'
+          $i = (Select-String -Path $f -Pattern 'CascadiaSettings::ApplicationVersion').LineNumber | Select-Object -First 1
+          Get-Content $f | Select-Object -Skip ($i - 1) -First 60
+
+      - name: Add VERSIONINFO resources (exe + settings-model dll)
+        shell: pwsh
+        run: |
+          # Local builds produce binaries with NO version resource. When unpackaged, About reads
+          # \VarFileInfo\Translation and then \StringFileInfo\<lang><cp>\ProductVersion from a
+          # binary's version resource, else shows "unknown". The function lives in
+          # Microsoft.Terminal.Settings.Model.dll, so give BOTH it and the exe a resource
+          # (harmless for whichever one it really queries).
+          # We add our own version.rc per project instead of editing existing .rc files.
+          # Numeric constants avoid any dependence on winver.h include paths.
+          $p = $env:BUILT_VERSION.Split('.')
+          $targets = @(
+            @{ Dir='src/cascadia/WindowsTerminal'; Proj='WindowsTerminal.vcxproj'
+               Desc='Windows Terminal Host'; Internal='WindowsTerminal'; File='WindowsTerminal.exe'; Type='0x1L'; Required=$true },
+            @{ Dir='src/cascadia/TerminalSettingsModel/dll'; Proj='Microsoft.Terminal.Settings.Model.vcxproj'
+               Desc='Windows Terminal Settings Model Library'; Internal='Microsoft.Terminal.Settings.Model'; File='Microsoft.Terminal.Settings.Model.dll'; Type='0x2L'; Required=$true }
+          )
+          foreach ($t in $targets) {
+            $rc = @(
+              '1 VERSIONINFO',
+              " FILEVERSION $($p[0]),$($p[1]),$($p[2]),$($p[3])",
+              " PRODUCTVERSION $($p[0]),$($p[1]),$($p[2]),$($p[3])",
+              ' FILEFLAGSMASK 0x3fL',
+              ' FILEFLAGS 0x0L',
+              ' FILEOS 0x40004L',
+              " FILETYPE $($t.Type)",
+              ' FILESUBTYPE 0x0L',
+              'BEGIN',
+              '  BLOCK "StringFileInfo"',
+              '  BEGIN',
+              '    BLOCK "040904b0"',
+              '    BEGIN',
+              "      VALUE `"FileDescription`", `"$($t.Desc)`"",
+              "      VALUE `"FileVersion`", `"$env:BUILT_VERSION`"",
+              "      VALUE `"InternalName`", `"$($t.Internal)`"",
+              "      VALUE `"OriginalFilename`", `"$($t.File)`"",
+              '      VALUE "ProductName", "Windows Terminal"',
+              "      VALUE `"ProductVersion`", `"$env:BUILT_VERSION_DESC`"",
+              '    END',
+              '  END',
+              '  BLOCK "VarFileInfo"',
+              '  BEGIN',
+              '    VALUE "Translation", 0x409, 1200',
+              '  END',
+              'END'
+            ) -join "`n"
+
+            $proj = Join-Path $PWD "$($t.Dir)/$($t.Proj)"
+            if (-not (Test-Path $proj)) { throw "Project not found: $proj" }
+            [IO.File]::WriteAllText((Join-Path $PWD "$($t.Dir)/version.rc"), $rc + "`n", [Text.Encoding]::ASCII)
+
+            $x = [IO.File]::ReadAllText($proj)
+            $n = [regex]::Replace($x, '</Project>\s*$',
+                   "  <ItemGroup>`n    <ResourceCompile Include=`"version.rc`" />`n  </ItemGroup>`n</Project>")
+            if ($n -eq $x) { throw "Could not add version.rc to $($t.Proj)" }
+            [IO.File]::WriteAllText($proj, $n)
+            Write-Host "Added version.rc ($env:BUILT_VERSION_DESC) to $($t.Proj)"
+          }
+
+      # NuGet.Config points at the anonymously readable public Azure DevOps feed
+      # (pkgs.dev.azure.com/shine-oss/terminal/_packaging/TerminalDependencies), so plain restore works.
+      - name: NuGet restore
+        run: |
+          nuget restore OpenConsole.slnx
+          nuget restore dep\nuget\packages.config
+
+      - name: Build CascadiaPackage (Release, x64, appx generation on)
+        shell: pwsh
+        run: |
+          Import-Module .\tools\OpenConsole.psm1
+          # arch is auto-detected from PROCESSOR_ARCHITECTURE (x64 on this runner)
+          Set-MsbuildDevEnvironment
+          # WindowsTerminalOfficialBuild=true also ships the Cascadia fonts in the package.
+          # PDBs stay ON (cheap insurance for crash-dump decoding).
+          msbuild.exe OpenConsole.slnx `
+            /t:"Terminal\CascadiaPackage" /m `
+            /p:Configuration=Release /p:Platform=x64 `
+            /p:WindowsTerminalOfficialBuild=true `
+            /p:WindowsTerminalBranding=Canary `
+            /p:PGOBuildMode=None
+
+      # TEMPORARY diagnostic: what version resource did the exe actually get?
+      # About reads ProductVersion from it. Delete once About shows the right version.
+      - name: "[diag] Version resource of built binaries"
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Get-ChildItem bin -Recurse -Include WindowsTerminal.exe,Microsoft.Terminal.Settings.Model.dll | ForEach-Object {
+            $_.FullName
+            $_.VersionInfo | Format-List FileDescription, FileVersion, ProductVersion, OriginalFilename | Out-String | Write-Host
+          }
+
+      - name: Locate MSIX and WinUI dependency appx
+        shell: pwsh
+        run: |
+          $msix = Get-ChildItem -Recurse -Filter 'CascadiaPackage*.msix' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msix) { throw 'No CascadiaPackage*.msix found. Did the appx generation run?' }
+          Write-Host "MSIX: $($msix.FullName)"
+
+          # There is ONE Microsoft.UI.Xaml appx per architecture; pin to the MSIX's arch
+          # (..._<arch>.msix) so we don't grab the arm64 one by accident.
+          if ($msix.BaseName -match '_(?<arch>x86|x64|arm64|win32)$') {
+            $arch = $Matches.arch
+            if ($arch -eq 'win32') { $arch = 'x86' }
+          } else {
+            throw "Could not parse architecture from MSIX name: $($msix.Name)"
+          }
+          $depsDir = Join-Path $msix.DirectoryName "Dependencies\$arch"
+          $xamlAppx = Get-ChildItem $depsDir -Filter 'Microsoft.UI.Xaml*.appx' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $xamlAppx) {
+            $xamlAppx = Get-ChildItem -Recurse -Filter 'Microsoft.UI.Xaml*.appx' |
+              Where-Object { $_.FullName -match "\\Dependencies\\$arch\\" } |
+              Select-Object -First 1
+          }
+          if (-not $xamlAppx) { throw "No Microsoft.UI.Xaml*.appx dependency found for arch '$arch' under $depsDir" }
+          Write-Host "XamlAppx: $($xamlAppx.FullName)"
+
+          "MSIX_PATH=$($msix.FullName)"         >> $env:GITHUB_ENV
+          "XAMLAPPX_PATH=$($xamlAppx.FullName)" >> $env:GITHUB_ENV
+
+      - name: Build unpackaged (portable) distribution
+        shell: pwsh
+        run: |
+          # The script unpacks into a TEMP dir that it deletes afterwards, so we must locate the
+          # produced .zip in -Destination, not a terminal-* directory.
+          # -PortableMode is a runtime flag: it writes the .portable marker so settings are stored
+          # next to WindowsTerminal.exe instead of %LOCALAPPDATA%\Packages\...
+          $outDir = New-Item -ItemType Directory (Join-Path $env:GITHUB_WORKSPACE 'work') -Force
+          & .\build\scripts\New-UnpackagedTerminalDistribution.ps1 `
+            -TerminalAppX "$env:MSIX_PATH" `
+            -XamlAppX "$env:XAMLAPPX_PATH" `
+            -PortableMode `
+            -Destination $outDir.FullName
+          if ($LASTEXITCODE -Ne 0) { throw 'New-UnpackagedTerminalDistribution failed' }
+
+          $zip = Get-ChildItem $outDir.FullName -Filter 'Microsoft.WindowsTerminal*.zip' |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $zip) { throw 'No Microsoft.WindowsTerminal*.zip produced in destination' }
+          "DIST_ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Distribution zip: $($zip.FullName) ($('{0:N0}' -f $zip.Length) bytes)"
+
+      - name: Verify distribution (fail fast on a broken zip)
+        shell: pwsh
+        run: |
+          # Read entries straight from the zip. resources.pri must contain the MERGED MUX
+          # resources (>= 8 MB; microsoft's is ~11.6 MB), and the WinUI runtime must be present.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($env:DIST_ZIP)
+          try {
+            $checks = @(
+              @{ Name = 'resources.pri';         Min = 8MB; Why = 'merged MUX+Terminal resources.pri (missing MUX half = 0x802B000A crash at startup)' },
+              @{ Name = 'Microsoft.UI.Xaml.dll'; Min = 1MB; Why = 'WinUI runtime for reg-free activation (missing = REGDB_E_CLASSNOTREG crash)' },
+              @{ Name = 'WindowsTerminal.exe';   Min = 1KB; Why = 'the app itself' }
+            )
+            $bad = @()
+            foreach ($c in $checks) {
+              $entry = $archive.Entries | Where-Object { $_.Name -eq $c.Name } | Select-Object -First 1
+              if (-not $entry) {
+                $bad += "MISSING: $($c.Name): $($c.Why)"
+                continue
+              }
+              if ($entry.Length -lt $c.Min) {
+                $bad += ("{0} is {1:N0} bytes (min {2:N0}): {3}" -f $c.Name, $entry.Length, $c.Min, $c.Why)
+              }
+            }
+            if ($bad) {
+              foreach ($b in $bad) { Write-Host "::error::$b" }
+              throw 'Distribution verification failed'
+            }
+            $archive.Entries |
+              Where-Object { -not $_.FullName.EndsWith('/') } |
+              Sort-Object Length -Descending |
+              Select-Object -First 25 FullName, Length |
+              Format-Table -AutoSize | Out-String | Write-Host
+          } finally {
+            $archive.Dispose()
+          }
+          Write-Host 'Distribution verification passed.'
+
+      - name: Collect portable zip and PDBs
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory (Join-Path $env:GITHUB_WORKSPACE 'out') -Force
+          Copy-Item $env:DIST_ZIP (Join-Path $out 'WindowsTerminal-x64-portable.zip') -Force
+
+          # PDBs for resolving crash dumps; separate artifact, NOT in the zip users run.
+          $pdbRoot = "$PWD\bin\x64\Release"
+          $pdbs = @(
+            'WindowsTerminal\WindowsTerminal.pdb',
+            'WindowsTerminal\TerminalApp.pdb',
+            'WindowsTerminal\Microsoft.Terminal.Control.pdb',
+            'WindowsTerminal\TerminalThemeHelpers.pdb',
+            'WindowsTerminal\TerminalSettingsModel.pdb',
+            'WindowsTerminal\TerminalConnection.pdb'
+          ) | ForEach-Object { Join-Path $pdbRoot $_ } | Where-Object { Test-Path $_ }
+          if (-not $pdbs) { throw "No PDBs found under $pdbRoot" }
+          Compress-Archive -Path $pdbs -DestinationPath (Join-Path $out 'WindowsTerminal-x64-symbols.zip')
+          Get-ChildItem $out | Format-Table Name, Length
+
+      # Release downloads come from GitHub's CDN and are much faster than artifact downloads.
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Windows Terminal ${{ env.BUILT_VERSION_DESC }} (${{ env.BUILT_SHA_SHORT }}, build ${{ github.run_number }})
+          files: |
+            out/WindowsTerminal-x64-portable.zip
+            out/WindowsTerminal-x64-symbols.zip
+          body: |
+            Portable build of microsoft/terminal: Release, x64 only, Canary branding.
+            Version: ${{ env.BUILT_VERSION_DESC }}
+            Upstream commit: ${{ env.BUILT_SHA }}
+            Patch/workflow commit: ${{ github.sha }}
+
+            **Usage:**
+            * Extract anywhere and run `WindowsTerminal.exe` from the extracted folder.
+            * No install, no Developer Mode, no admin rights needed.
+
+            `WindowsTerminal-x64-symbols.zip` is the matching PDB set. Keep it only
+            if you need to decode a crash dump; it is not needed to run the app.
+
+      # Fallback for debugging; delete this step if you don't need it
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-x64-portable
+          path: |
+            out/WindowsTerminal-x64-portable.zip
+            out/WindowsTerminal-x64-symbols.zip
