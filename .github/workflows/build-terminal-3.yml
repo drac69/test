@@ -1,8 +1,9 @@
-# Build Windows Terminal (microsoft/terminal) on GitHub Actions, with a local patch on top.
+# Build Windows Terminal (microsoft/terminal) on GitHub Actions, with local patches on top.
 #
 # Repo layout (this repo, NOT a fork of microsoft/terminal):
 #   .github/workflows/build-terminal.yml   <- this file
-#   terminal-customizations.patch          <- applied on top of the pinned upstream commit
+#   patches/NN-*.patch                     <- applied in order on top of the pinned upstream commit
+#   MAINTENANCE.md                         <- how to update the patches when TERMINAL_REF changes
 #
 # Produces: WindowsTerminal-x64-portable.zip (+ matching symbols zip), published as a release.
 #
@@ -35,7 +36,7 @@ on:
         default: ''
 
 env:
-  # Pinned upstream commit (1.25 release-branch). Bump deliberately, then check the patch still applies.
+  # Pinned upstream commit (1.25 release-branch). Bump deliberately, then check the patches still apply (see MAINTENANCE.md).
   TERMINAL_REF: f88b209f1e57e1d8ca35977260c3cddacccaeb31
 
 # needed to create a release via the GitHub API
@@ -53,7 +54,7 @@ jobs:
         working-directory: terminal
 
     steps:
-      - name: Checkout this repo (workflow + patch)
+      - name: Checkout this repo (workflow + patches)
         uses: actions/checkout@v4
         with:
           path: mine
@@ -75,48 +76,54 @@ jobs:
           "BUILT_SHA_SHORT=$($sha.Substring(0,10))" >> $env:GITHUB_ENV
           Write-Host "Building microsoft/terminal @ $sha"
 
-      - name: Apply local customizations patch
+      - name: Apply local patches (patches/*.patch)
         shell: pwsh
         run: |
-          # terminal-customizations.patch (in this repo's root) does two things:
-          #   (1) TermControl.xaml: scrollbar widened to 24px, thumb pinned at full width,
-          #       no hover-expand animation.
-          #   (2) TerminalWindow.cpp/.h: drop the "Settings" entry from the Win32 system menu
-          #       (it landed after "Close"). Settings stays reachable via Ctrl+, / palette / dropdown.
+          # Patches live in this repo's patches/ folder and are applied in filename order:
+          #   01-scrollbar.patch          TermControl.xaml: scrollbar widened, thumb pinned at full
+          #                               width, no hover-expand animation.
+          #   02-no-settings-menu.patch   TerminalWindow.cpp/.h: drop the "Settings" entry from the
+          #                               Win32 system menu (it landed after "Close"). Settings stays
+          #                               reachable via Ctrl+, / palette / dropdown.
+          # See MAINTENANCE.md for how to rebase them when TERMINAL_REF changes.
           #
           # Line endings: git apply matches context byte-for-byte and does NOT treat \r as
-          # whitespace, and checkouts can come up with mixed CRLF/LF per file type. So force the
-          # patch and its three target files to LF right before applying. MSVC and the XAML
+          # whitespace, and checkouts can come up with mixed CRLF/LF per file type. So force each
+          # patch and the files it touches to LF right before applying. MSVC and the XAML
           # compiler build LF sources fine.
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'mine/terminal-customizations.patch'
-          if (-not (Test-Path $patch)) {
-            throw "terminal-customizations.patch not found in the repo root ($patch)"
-          }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'mine/patches'
+          $patches = @(Get-ChildItem $dir -Filter '*.patch' -ErrorAction SilentlyContinue | Sort-Object Name)
+          if ($patches.Count -eq 0) { throw "No patches found in $dir" }
 
-          $patchText = [IO.File]::ReadAllText($patch) -replace "`r", ""
-          [IO.File]::WriteAllText($patch, $patchText)
+          $failed = @()
+          foreach ($pf in $patches) {
+            $text = [IO.File]::ReadAllText($pf.FullName) -replace "`r", ""
+            [IO.File]::WriteAllText($pf.FullName, $text)
 
-          $targets = @(
-            'src/cascadia/TerminalControl/TermControl.xaml',
-            'src/cascadia/TerminalApp/TerminalWindow.cpp',
-            'src/cascadia/TerminalApp/TerminalWindow.h'
-          )
-          foreach ($t in $targets) {
-            $full = Join-Path $PWD $t
-            if (Test-Path $full) {
-              $c = [IO.File]::ReadAllText($full) -replace "`r", ""
-              [IO.File]::WriteAllText($full, $c)
+            # Files this patch touches, from its "+++ b/<path>" headers.
+            foreach ($m in [regex]::Matches($text, '(?m)^\+\+\+ b/(.+)$')) {
+              $full = Join-Path $PWD $m.Groups[1].Value.Trim()
+              if (Test-Path $full) {
+                $c = [IO.File]::ReadAllText($full) -replace "`r", ""
+                [IO.File]::WriteAllText($full, $c)
+              }
             }
-          }
 
-          # No fuzz: if upstream context drifted, fail early with an actionable message.
-          & git apply --check --verbose $patch
-          if ($LASTEXITCODE -ne 0) {
-            throw "Patch does not apply to $env:BUILT_SHA. Bump/rebase TERMINAL_REF or regenerate the patch."
+            # No fuzz: if upstream context drifted, say which patch broke. Keep going so one
+            # run reports every broken patch instead of only the first.
+            & git apply --check --verbose $pf.FullName 2>&1 | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::$($pf.Name) does not apply to $env:BUILT_SHA"
+              $failed += $pf.Name
+              continue
+            }
+            & git apply --verbose $pf.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $pf.Name; continue }
+            Write-Host "Applied $($pf.Name)"
           }
-          & git apply --verbose $patch
-          if ($LASTEXITCODE -ne 0) { throw "git apply failed (exit $LASTEXITCODE)" }
-          Write-Host 'terminal-customizations.patch applied.'
+          if ($failed.Count -gt 0) {
+            throw "Patch(es) failed against ${env:BUILT_SHA}: $($failed -join ', '). Bump/rebase TERMINAL_REF or regenerate them (see MAINTENANCE.md)."
+          }
 
       - name: Derive version from the nearest release tag
         shell: pwsh
